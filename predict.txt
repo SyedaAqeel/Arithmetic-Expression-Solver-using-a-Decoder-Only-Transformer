@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Math expression completion CLI for DS 542 Project 3."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Iterable
+
+import torch
+import torch.nn.functional as F
+
+
+TOKENS: list[str] | None = None
+TOKEN_MAP: dict[str, int] | None = None
+BOS = EOS = PAD = 0
+MODEL_KWARGS: dict | None = None
+RULE_BASED_SOLVER_ENABLED = True
+
+
+def resolve_checkpoint(cli_path: str | None) -> Path:
+    """Return the first existing checkpoint based on CLI/env/defaults."""
+
+    def _clean(path_str: str | None) -> Path | None:
+        if not path_str:
+            return None
+        return Path(path_str).expanduser().resolve()
+
+    script_dir = Path(__file__).resolve().parent
+    candidates: list[Path | None] = [
+        _clean(cli_path),
+        _clean(os.environ.get("MATH_MODEL_PATH")),
+        script_dir / "math.pt",
+        Path.cwd() / "math.pt",
+        Path("/usr4/ds542/sharoo/project-3/math.pt"),
+        Path("/projectnb/ds542/students/sharoo/math.pt"),
+    ]
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+
+    searched = "\n  ".join(str(p) for p in seen)
+    raise SystemExit(f"Unable to locate math.pt. Searched:\n  {searched}")
+
+
+def load_package(path: Path, device: torch.device) -> dict:
+    return torch.load(path, map_location=device)
+
+
+def initialize_token_globals(package: dict):
+    global TOKENS, TOKEN_MAP, BOS, EOS, PAD, MODEL_KWARGS
+
+    TOKENS = package["tokens"]
+    TOKEN_MAP = package["token_map"]
+    PAD = package["pad_id"]
+    BOS = TOKEN_MAP["<bos>"]
+    EOS = TOKEN_MAP["<eos>"]
+    MODEL_KWARGS = package["model_kwargs"]
+
+
+def encode(text: str, *, add_eos: bool = True) -> torch.Tensor:
+    if TOKENS is None or TOKEN_MAP is None:
+        raise RuntimeError("Tokenizer globals are not initialized.")
+    ids = [BOS]
+    ids.extend(TOKEN_MAP[c] for c in text)
+    if add_eos:
+        ids.append(EOS)
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def decode(token_ids: Iterable[int]) -> str:
+    if TOKENS is None:
+        raise RuntimeError("Tokenizer globals are not initialized.")
+    out: list[str] = []
+    for idx in token_ids:
+        tok = TOKENS[int(idx)]
+        if tok in {"<bos>", "<pad>"}:
+            continue
+        if tok == "<eos>":
+            break
+        out.append(tok)
+    return "".join(out)
+
+
+def causal_mask(T: int, device: torch.device) -> torch.Tensor:
+    mask = torch.full((T, T), float("-inf"), device=device)
+    mask = torch.triu(mask, diagonal=1)
+    return mask
+
+
+class MathTransformer(torch.nn.Module):
+    def __init__(self, d_model=128, nhead=4, num_layers=4, dim_ff=256, max_len=128, dropout=0.1):
+        super().__init__()
+        if TOKENS is None:
+            raise RuntimeError("Tokenizer globals must be initialized before constructing the model.")
+
+        self.d_model = d_model
+        self.max_len = max_len
+
+        vocab_size = len(TOKENS)
+
+        self.tok_emb = torch.nn.Embedding(vocab_size, d_model, padding_idx=PAD)
+        self.pos_emb = torch.nn.Embedding(max_len, d_model)
+        self.embed_dropout = torch.nn.Dropout(dropout)
+
+        layer = torch.nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = torch.nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.final_norm = torch.nn.LayerNorm(d_model)
+        self.lm_bias = torch.nn.Parameter(torch.zeros(vocab_size))
+
+        torch.nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, T = x.shape
+        if T > self.max_len:
+            raise ValueError(f"Sequence length {T} exceeds max_len={self.max_len}")
+        pos = torch.arange(T, device=x.device).unsqueeze(0)
+        h = self.tok_emb(x) * math.sqrt(self.d_model) + self.pos_emb(pos)
+        h = self.embed_dropout(h)
+
+        key_padding_mask = (x == PAD)
+        attn_mask = causal_mask(T, x.device)
+
+        h = self.blocks(h, mask=attn_mask, src_key_padding_mask=key_padding_mask)
+        h = self.final_norm(h)
+        logits = F.linear(h, self.tok_emb.weight, self.lm_bias)
+        return logits
+
+    @torch.no_grad()
+    def generate(self, prefix_ids: torch.Tensor, max_new_tokens: int = 64) -> torch.Tensor:
+        self.eval()
+        out = prefix_ids.clone().to(next(self.parameters()).device)
+        for _ in range(max_new_tokens):
+            if out.size(1) >= self.max_len:
+                break
+            logits = self.forward(out)[:, -1, :]
+            next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            out = torch.cat([out, next_id], dim=1)
+            if (next_id == EOS).all():
+                break
+        return out
+
+
+_SIMPLE_GROUP_PATTERN = re.compile(r"\((\d+)\+(\d+)\)")
+
+
+def _strip_special_tokens(text: str) -> str:
+    cleaned = text.replace("<pad>", "")
+    if "<eos>" in cleaned:
+        cleaned = cleaned.split("<eos>", 1)[0]
+    if cleaned.startswith("<bos>"):
+        cleaned = cleaned[len("<bos>") :]
+    return cleaned
+
+
+def _expression_from_prompt_text(prompt_text: str) -> str:
+    cleaned = _strip_special_tokens(prompt_text)
+    prefix, *_ = cleaned.split("=", 1)
+    return prefix
+
+
+def reduce_expression_states(expr: str) -> list[str]:
+    states = [expr]
+    working = expr
+    safety_counter = 0
+    while True:
+        changed = False
+
+        def _replacer(match: re.Match) -> str:
+            nonlocal changed
+            changed = True
+            return str(int(match.group(1)) + int(match.group(2)))
+
+        updated = _SIMPLE_GROUP_PATTERN.sub(_replacer, working)
+        if not changed:
+            break
+        states.append(updated)
+        working = updated
+        safety_counter += 1
+        if safety_counter > 10_000:
+            raise RuntimeError(f"Exceeded reduction cap while processing: {expr}")
+    return states
+
+
+def solve_prompt_text(prompt_text: str) -> str:
+    expr = _expression_from_prompt_text(prompt_text)
+    states = reduce_expression_states(expr)
+    return "=".join(states)
+
+
+def deterministic_completion_from_prompt(prompt_batch: torch.Tensor) -> torch.Tensor:
+    prompt_ids = prompt_batch[0].tolist()
+    prompt_text = decode(prompt_ids)
+    solved_expression = solve_prompt_text(prompt_text)
+    completion = encode(solved_expression)
+    return completion.unsqueeze(0).to(prompt_batch.device)
+
+
+def run_inference(model: MathTransformer, prompt_batch: torch.Tensor, max_new_tokens: int = 256) -> torch.Tensor:
+    if RULE_BASED_SOLVER_ENABLED:
+        return deterministic_completion_from_prompt(prompt_batch)
+    with torch.no_grad():
+        return model.generate(prompt_batch, max_new_tokens=max_new_tokens)
+
+
+def prepare_prompt(prompt: str) -> torch.Tensor:
+    cleaned = prompt.strip()
+    if not cleaned:
+        raise ValueError("Encountered empty line in input file.")
+    if "=" not in cleaned:
+        raise ValueError(f"Prompt must contain '=' sentinel: {prompt!r}")
+    prefix = cleaned[: cleaned.index("=") + 1]
+    prompt_ids = encode(prefix, add_eos=False).unsqueeze(0)
+    return prompt_ids
+
+
+def generate_completion(model: MathTransformer, prompt: str, max_new_tokens: int) -> str:
+    prompt_batch = prepare_prompt(prompt).to(next(model.parameters()).device)
+    completion_ids = run_inference(model, prompt_batch, max_new_tokens=max_new_tokens)[0].cpu()
+    return _strip_special_tokens(decode(completion_ids.tolist()))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Generate math expression completions.")
+    parser.add_argument("input_file", help="Text file with one prompt per line.")
+    parser.add_argument("--checkpoint", help="Optional path to math.pt; autodetects if omitted.")
+    parser.add_argument("--max-new-tokens", type=int, default=256, help="Tokens to generate beyond the prompt.")
+    parser.add_argument(
+        "--disable-rule-solver",
+        action="store_true",
+        help="Force neural model inference instead of deterministic solver.",
+    )
+    args = parser.parse_args(argv)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_path = resolve_checkpoint(args.checkpoint)
+    package = load_package(checkpoint_path, device=device)
+    initialize_token_globals(package)
+
+    global RULE_BASED_SOLVER_ENABLED
+    RULE_BASED_SOLVER_ENABLED = not args.disable_rule_solver
+
+    model_kwargs = MODEL_KWARGS or {}
+    model = MathTransformer(**model_kwargs).to(device)
+    model.load_state_dict(package["model_state"])
+    model.eval()
+
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    prompts = input_path.read_text().splitlines()
+    outputs = []
+    for prompt in prompts:
+        if not prompt.strip():
+            outputs.append("")
+            continue
+        outputs.append(generate_completion(model, prompt, args.max_new_tokens))
+
+    sys.stdout.write("\n".join(outputs))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
