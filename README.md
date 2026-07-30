@@ -4,7 +4,7 @@ This project trains a decoder-only transformer to solve nested arithmetic expres
 
 
 <p align="center">
-  <img src="Figure.png" alt="Arithmetic Expression Solver using a Decoder-Only Transformer" width="50"/>
+  <img src="Figure.png" alt="Arithmetic Expression Solver using a Decoder-Only Transformer" width="150"/>
 </p>
 
 
